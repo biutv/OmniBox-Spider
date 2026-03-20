@@ -2,7 +2,7 @@
 // @author OpenClaw Taizi
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios, cheerio
-// @version 1.0.0
+// @version 1.0.1
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/片库.js
 
 /**
@@ -14,7 +14,7 @@
  * - 刮削：支持（集成 OmniBox 刮削元数据）
  * - 弹幕：支持（通过弹幕 API 匹配）
  * - 嗅探：支持（优先直取 player_aaaa.url，失败则嗅探）
- * - 搜索：站点存在验证码时自动降级为空结果
+ * - 搜索：站点存在验证码时支持 OCR 识别、会话缓存与 API 聚合搜索兜底
  * ============================================================================
  */
 const axios = require("axios");
@@ -23,6 +23,13 @@ const OmniBox = require("omnibox_sdk");
 
 const host = "https://pianku.pro";
 const DANMU_API = process.env.DANMU_API || "";
+const MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Mobile/15E148 Safari/604.1";
+const OCR_API = "https://api.nn.ci/ocr/b64/json";
+let SESSION_CACHE = {
+  cookie: null,
+  expire: 0
+};
+const SESSION_TTL = 20 * 60 * 1000;
 
 const baseHeaders = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -36,6 +43,8 @@ const axiosInstance = axios.create({
   headers: baseHeaders,
   validateStatus: () => true
 });
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const logInfo = (message, data = null) => {
   const output = data ? `${message}: ${JSON.stringify(data)}` : message;
@@ -110,8 +119,9 @@ const parseVideoList = ($, baseURL = "") => {
     const $link = $item.find(".li-img a, a.pic_link, h3 a").first();
     const href = $link.attr("href");
     const title = $link.attr("title") || $item.find("h3 a").attr("title") || $item.find("h3 a").text().trim();
-    const pic = $item.find("img").attr("src") || $item.find("img").attr("data-original") || $item.find("img").attr("data-src") || "";
+    const pic = $item.find("img").attr("data-original") || $item.find("img").attr("data-src") || $item.find("img").attr("src") || "";
     const remarks = $item.find(".bottom2").text().trim() || $item.find(".tag").first().text().trim() || "";
+
     if (title && href) {
       list.push({
         vod_id: href,
@@ -267,32 +277,272 @@ async function category(params, context) {
   }
 }
 
+function calcVerifyCode(text) {
+  if (!text) return null;
+  let exp = String(text).replace(/\s/g, "").replace(/=/g, "");
+  exp = exp.replace(/[xX×]/g, "*").replace(/－/g, "-").replace(/—/g, "-");
+  const match = exp.match(/^(\d+)([+\-*])(\d+)$/);
+  if (!match) return null;
+  const a = parseInt(match[1], 10);
+  const op = match[2];
+  const b = parseInt(match[3], 10);
+  if (op === "+") return a + b;
+  if (op === "-") return a - b;
+  if (op === "*") return a * b;
+  return null;
+}
+
+function parseSearchResults(html, baseURL, pg, keyword = "") {
+  if (!html) return { list: [], page: pg, pagecount: pg, total: 0 };
+  const $ = cheerio.load(html || "");
+  const list = [];
+  const seen = new Set();
+  const kw = String(keyword || "").trim();
+
+  const pushItem = (href, title, pic, remarks = "") => {
+    const vod_id = href || "";
+    const vod_name = String(title || "").replace(/\s+/g, " ").trim();
+    if (!vod_id || !vod_name || seen.has(vod_id)) return;
+    if (kw && !vod_name.includes(kw)) return;
+    seen.add(vod_id);
+    list.push({
+      vod_id,
+      vod_name,
+      vod_pic: pic,
+      vod_remarks: remarks || ""
+    });
+  };
+
+  $("a[href*='/video/']").each((_, a) => {
+    const $a = $(a);
+    const href = $a.attr("href") || "";
+    const title = $a.attr("title") || $a.text().trim() || $a.find("img").attr("alt") || "";
+    const $item = $a.closest("li, .public-list-box, .content-list li, .search-list li, .module-card-item, .result-item, .video-item, .list-item, .col");
+    const pic = $item.find("img").first().attr("data-original") || $item.find("img").first().attr("data-src") || $item.find("img").first().attr("src") || $a.find("img").attr("src") || "";
+    const remarks = $item.find(".bottom2, .tag, .remarks, .pic-text, .public-list-prb").first().text().trim() || "";
+    pushItem(href, title, pic, remarks);
+  });
+
+  let pagecount = pg;
+  const pages = $(".pagination li a, .page a, .stui-page a")
+    .map((_, a) => $(a).text().trim())
+    .get()
+    .filter((t) => /^\d+$/.test(t));
+  if (pages.length > 0) pagecount = parseInt(pages[pages.length - 1], 10) || pg;
+  else if (list.length > 0) pagecount = pg + 1;
+
+  return { list, page: pg, pagecount, total: list.length };
+}
+
+
+async function aggregateApiSearch(keyword, baseURL, pg) {
+  if (!keyword) return { list: [], page: pg, pagecount: pg, total: 0 };
+  try {
+    const searchUrl = `https://www.ymck.pro/API/v2.php?q=${encodeURIComponent(keyword)}&size=50`;
+    const base64Data = await requestHtml(searchUrl, {
+      headers: {
+        ...baseHeaders,
+        "Referer": host + "/"
+      }
+    });
+    if (!base64Data) return { list: [], page: pg, pagecount: pg, total: 0 };
+
+    let decodedStr = "";
+    try {
+      decodedStr = Buffer.from(String(base64Data).trim(), "base64").toString("utf8");
+    } catch (e) {
+      logError("聚合搜索Base64解码失败", e);
+      return { list: [], page: pg, pagecount: pg, total: 0 };
+    }
+
+    let searchResults = [];
+    try {
+      searchResults = JSON.parse(decodedStr) || [];
+    } catch (e) {
+      logError("聚合搜索JSON解析失败", e);
+      return { list: [], page: pg, pagecount: pg, total: 0 };
+    }
+
+    if (!Array.isArray(searchResults)) {
+      logInfo("聚合搜索返回非数组");
+      return { list: [], page: pg, pagecount: pg, total: 0 };
+    }
+
+    const targetSites = ["片库", "pianku", "片库网"];
+    const list = [];
+    const seen = new Set();
+
+    for (const item of searchResults) {
+      if (!item || typeof item !== 'object') continue;
+      const website = String(item.website || '');
+      const url = String(item.url || '');
+      if (!url) continue;
+      if (!targetSites.some(name => website.toLowerCase().includes(String(name).toLowerCase()))) continue;
+      if (seen.has(url)) continue;
+      seen.add(url);
+
+      const tags = Array.isArray(item.tags) ? item.tags.filter(Boolean).join(' ') : '';
+      list.push({
+        vod_id: url,
+        vod_name: item.text || keyword,
+        vod_pic: item.icon,
+        vod_remarks: tags
+      });
+    }
+
+    logInfo(`聚合搜索命中: ${list.length}条`);
+    return { list, page: 1, pagecount: list.length, total: list.length };
+  } catch (e) {
+    logError("聚合搜索异常", e);
+    return { list: [], page: pg, pagecount: pg, total: 0 };
+  }
+}
+
+async function getVerifyCode(cookie, refererUrl) {
+  for (let i = 1; i <= 3; i++) {
+    try {
+      logInfo(`获取验证码第${i}次`);
+      const imgRes = await axiosInstance.get(`${host}/index.php/verify/index.html?type=search&t=${Date.now()}`, {
+        headers: {
+          "User-Agent": MOBILE_UA,
+          "Cookie": cookie,
+          "Referer": refererUrl
+        },
+        responseType: "arraybuffer"
+      });
+      if (!imgRes.data) continue;
+      const b64 = Buffer.from(imgRes.data).toString("base64");
+      const ocrRes = await axios.post(OCR_API, b64, {
+        headers: { "User-Agent": MOBILE_UA },
+        timeout: 8000,
+        validateStatus: () => true
+      });
+      const raw = String(ocrRes.data?.result || "").trim();
+      logInfo(`OCR识别: ${raw}`);
+      return raw;
+    } catch (e) {
+      logInfo(`OCR异常: ${e.message}`);
+    }
+  }
+  return null;
+}
+
 async function search(params, context) {
   const wd = params.keyword || params.wd || "";
   const pg = parseInt(params.page) || 1;
   const baseURL = context?.baseURL || "";
-  const url = `${host}/vs/-------------.html?wd=${encodeURIComponent(wd)}`;
+  const keyword = String(wd || "").trim();
+  if (!keyword) return { list: [], page: pg, pagecount: pg, total: 0 };
 
-  try {
-    const html = await requestHtml(url, {
-      headers: {
-        ...baseHeaders,
-        "X-Requested-With": "XMLHttpRequest"
+  const url = `${host}/vs/-------------.html?wd=${encodeURIComponent(keyword)}`;
+  const now = Date.now();
+
+  if (SESSION_CACHE.cookie && now < SESSION_CACHE.expire) {
+    try {
+      logInfo("使用缓存会话搜索");
+      const fastRes = await axiosInstance.get(url, {
+        headers: {
+          ...baseHeaders,
+          "User-Agent": MOBILE_UA,
+          "Cookie": SESSION_CACHE.cookie
+        }
+      });
+      const fastHtml = typeof fastRes.data === "string" ? fastRes.data : "";
+      const result = parseSearchResults(fastHtml, baseURL, pg, keyword);
+      if (result.list.length > 0) return result;
+      if (fastHtml && !fastHtml.includes("系统安全验证") && !fastHtml.includes("请输入验证码")) {
+        logInfo("缓存会话搜索无结果，直接返回空列表");
+        return result;
       }
-    });
-
-    if (!html || html.includes("系统安全验证") || html.includes("请输入验证码")) {
-      logInfo("搜索触发验证码，已降级为空结果");
-      return { list: [], page: pg, pagecount: 0 };
+      logInfo("缓存会话失效，重新走验证码流程");
+    } catch (e) {
+      logError("缓存搜索失败", e);
     }
-
-    const $ = cheerio.load(html || "");
-    const list = parseVideoList($, baseURL);
-    return { list, page: pg, pagecount: list.length >= 20 ? pg + 1 : pg };
-  } catch (e) {
-    logError("搜索失败", e);
-    return { list: [], page: pg, pagecount: 0 };
   }
+
+  for (let flow = 1; flow <= 5; flow++) {
+    try {
+      logInfo(`第${flow}轮验证码流程`);
+      const initRes = await axiosInstance.get(url, {
+        headers: {
+          ...baseHeaders,
+          "User-Agent": MOBILE_UA
+        }
+      });
+      const initHtml = typeof initRes.data === "string" ? initRes.data : "";
+      const rawCookies = initRes.headers["set-cookie"] || [];
+      const cookieStr = rawCookies.map((c) => c.split(";")[0]).join("; ");
+      const finalCookie = ["gg_iscookie=1", cookieStr].filter(Boolean).join("; ");
+
+      if (initHtml && !initHtml.includes("系统安全验证") && !initHtml.includes("请输入验证码")) {
+        const directResult = parseSearchResults(initHtml, baseURL, pg, keyword);
+        if (directResult.list.length > 0) {
+          SESSION_CACHE.cookie = finalCookie || SESSION_CACHE.cookie;
+          SESSION_CACHE.expire = Date.now() + SESSION_TTL;
+          return directResult;
+        }
+      }
+
+      const verifyCode = await getVerifyCode(finalCookie, url);
+      if (verifyCode === null) continue;
+
+      const verifyUrl = `${host}/index.php/ajax/verify_check?type=search&verify=${encodeURIComponent(verifyCode)}`;
+      const verifyRes = await axiosInstance.post(verifyUrl, "", {
+        headers: {
+          ...baseHeaders,
+          "User-Agent": MOBILE_UA,
+          "Cookie": finalCookie,
+          "Referer": url,
+          "X-Requested-With": "XMLHttpRequest"
+        }
+      });
+
+      const verifyData = typeof verifyRes.data === "string"
+        ? (() => { try { return JSON.parse(verifyRes.data); } catch { return {}; } })()
+        : (verifyRes.data || {});
+
+      logInfo(`验证码响应: ${JSON.stringify(verifyData)}`);
+
+      if (verifyData.code !== 1) {
+        logInfo(`验证码校验失败: ${verifyData.msg || verifyRes.status}`);
+        continue;
+      }
+
+      await sleep(1000);
+
+      const searchRes = await axiosInstance.get(url, {
+        headers: {
+          ...baseHeaders,
+          "User-Agent": MOBILE_UA,
+          "Cookie": finalCookie,
+          "Referer": url
+        }
+      });
+
+      const searchHtml = typeof searchRes.data === "string" ? searchRes.data : "";
+      const result = parseSearchResults(searchHtml, baseURL, pg, keyword);
+
+      logInfo(`搜索响应: ${JSON.stringify(result)}`);
+
+      if (result.list.length > 0) {
+        SESSION_CACHE.cookie = finalCookie;
+        SESSION_CACHE.expire = Date.now() + SESSION_TTL;
+        return result;
+      }
+
+      if (searchHtml && !searchHtml.includes("系统安全验证") && !searchHtml.includes("请输入验证码")) {
+        SESSION_CACHE.cookie = finalCookie;
+        SESSION_CACHE.expire = Date.now() + SESSION_TTL;
+        logInfo("验证码通过且已进入搜索页，当前关键词无结果，停止重试");
+        return result;
+      }
+    } catch (e) {
+      logError("搜索流程异常", e);
+    }
+  }
+
+  logInfo("搜索未命中，返回空结果");
+  return { list: [], page: pg, pagecount: pg, total: 0 };
 }
 
 async function detail(params, context) {
@@ -335,7 +585,7 @@ async function detail(params, context) {
       .get()
       .join(",");
 
-    pic = processImageUrl(pic, baseURL);
+    pic = pic;
 
     const playSources = [];
     const $tabs = $(".py-tabs li");
