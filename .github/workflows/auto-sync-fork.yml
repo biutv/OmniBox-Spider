@@ -1,0 +1,82 @@
+name: Auto Sync Fork
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Get upstream from API
+        id: get-upstream
+        run: |
+          RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}")
+          
+          UPSTREAM=$(echo "$RESPONSE" | jq -r '.parent.full_name // empty')
+          
+          if [ -n "$UPSTREAM" ] && [ "$UPSTREAM" != "null" ]; then
+            echo "upstream=$UPSTREAM" >> $GITHUB_OUTPUT
+            echo "✅ Found upstream: $UPSTREAM"
+          else
+            echo "❌ Not a fork repository"
+            exit 1
+          fi
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/${{ steps.get-upstream.outputs.upstream }}.git
+          git fetch upstream --force
+
+      - name: Backup workflow file
+        run: |
+          if [ -f .github/workflows/auto-sync-fork.yml ]; then
+            cp .github/workflows/auto-sync-fork.yml /tmp/auto-sync-fork.yml
+            echo "✅ Backed up workflow file"
+          fi
+
+      - name: Sync with upstream (preserve workflow)
+        run: |
+          UPSTREAM_BRANCH=$(git remote show upstream | grep 'HEAD branch' | cut -d' ' -f5)
+          echo "Upstream branch: $UPSTREAM_BRANCH"
+          
+          # 获取上游最新内容
+          git checkout $UPSTREAM_BRANCH
+          git pull upstream $UPSTREAM_BRANCH --no-rebase
+          
+          # 如果没有冲突，直接推送
+          git push origin $UPSTREAM_BRANCH
+
+      - name: Restore workflow file
+        run: |
+          if [ -f /tmp/auto-sync-fork.yml ]; then
+            mkdir -p .github/workflows
+            cp /tmp/auto-sync-fork.yml .github/workflows/auto-sync-fork.yml
+            git add .github/workflows/auto-sync-fork.yml
+            git commit -m "chore: restore auto-sync workflow" --allow-empty
+            git push origin HEAD
+            echo "✅ Restored workflow file"
+          fi
+
+      - name: Create report
+        run: |
+          echo "## Auto Sync Report" >> $GITHUB_STEP_SUMMARY
+          echo "**Time:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "**Upstream:** ${{ steps.get-upstream.outputs.upstream }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ✅ Synced (preserved local workflows)" >> $GITHUB_STEP_SUMMARY
